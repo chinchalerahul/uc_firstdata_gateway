@@ -1,0 +1,302 @@
+<?php
+// $Id$
+/**
+ * @file
+ * An Ubercart payment gateway module for First Data.
+ */
+
+define('UC_FIRSTDATA_GATEWAY_TEST_URL', 'https://ws.merchanttest.firstdataglobalgateway.com/fdggwsapi/services/order.wsdl');
+define('UC_FIRSTDATA_GATEWAY_PRODUCTION_URL', 'https://ws.firstdataglobalgateway.com/fdggwsapi/services/order.wsdl');
+
+/**
+ * Implements hook_payment_gateway().
+ */
+function uc_firstdata_gateway_uc_payment_gateway() {
+  $gateways['uc_firstdata_gateway'] = array(
+    'title' => t('First Data Gateway'),
+    'description' => t('Process credit card payments using the web service of First Data.'),
+    'settings' => 'uc_firstdata_gateway_settings_form',
+    'credit' => 'uc_firstdata_gateway_charge',
+  );
+
+  return $gateways;
+}
+
+/**
+ * Callback function for payment gateway settings.
+ */
+function uc_firstdata_gateway_settings_form() {
+  $form['firstdata_gateway_settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('First Data Gateway settings'),
+  );
+  $form['firstdata_gateway_settings']['uc_firstdata_gateway_login_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Store Number'),
+    '#default_value' => variable_get('uc_firstdata_gateway_login_id', ''),
+    '#description' => t("Enter your 10 digit Store Number assigned to you by Linkpoint."),
+  );
+  $form['firstdata_gateway_settings']['uc_firstdata_gateway_login_pw'] = array(
+    '#type' => 'password',
+    '#title' => t('Account Password'),
+    '#default_value' => variable_get('uc_firstdata_gateway_login_pw', ''),
+    '#description' => t('Enter the First Data WebService API password. You must have this for First Data Gateway to work. Get this by opening a file named "WS&lt;store_ID&gt;._.1.auth.txt" (replace "&lt;store_ID&gt;" with your store ID or user ID).'),
+  );
+  $form['firstdata_gateway_settings']['uc_firstdata_gateway_transaction_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Private Key File'),
+    '#default_value' => variable_get('uc_firstdata_gateway_transaction_key', ''),
+    '#description' => t('Enter the absolute path of your private key file (from your server root). You must have this for First Data Gateway to work. Get this by logging in to <a target="_blank" href="http://www.linkpointcentral.com">Linkpoint Central</a> > Support > Download Center. File should be named "WS&lt;store_ID&gt;._.1.key" (replace "&lt;store_ID&gt;" with your store ID or user ID).'),
+  );
+  $form['firstdata_gateway_settings']['uc_firstdata_gateway_transaction_cert'] = array(
+    '#type' => 'textfield',
+    '#title' => t('PEM File'),
+    '#default_value' => variable_get('uc_firstdata_gateway_transaction_cert', ''),
+    '#description' => t('Enter the absolute path of your PEM file (from your server root). You must have this for First Data Gateway to work. Get this by logging in to <a target="_blank" href="http://www.linkpointcentral.com">Linkpoint Central</a> > Support > Download Center. File should be named "WS&lt;store_ID&gt;._.1.pem" (replace "&lt;store_ID&gt;" with your store ID or user ID).'),
+  );
+  $form['firstdata_gateway_settings']['uc_firstdata_gateway_transaction_pw'] = array(
+    '#type' => 'password',
+    '#title' => t('Password for private key file'),
+    '#default_value' => variable_get('uc_firstdata_gateway_transaction_pw', ''),
+    '#description' => t('Enter the password of your private key file. You must have this for First Data Gateway to work. Get this by opening a file named "WS&lt;store_ID&gt;._.1.key.pw.txt" (replace "&lt;store_ID&gt;" with your store ID or user ID).'),
+  );
+  $form['firstdata_gateway_settings']['uc_firstdata_gateway_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction mode'),
+    '#default_value' => variable_get('uc_firstdata_gateway_mode', 'test'),
+    '#description' => t('You need to apply for a Customer Test Envirioment Test Account at http://www.firstdata.com/gg/apply_test_account.htm in order to use test mode. No charges apply in test mode.'),
+    '#options' => array(
+      'test' => t('Testing (Customer Test Environment)'),
+      'production' => t('Production'),
+    ),
+  );
+  
+  return $form;
+}
+
+/**
+ * Callback function for the credit payment method.
+ */
+function uc_firstdata_gateway_charge($order_id, $amount, $data) {
+  global $user;
+  if (!function_exists('curl_init')) {
+    drupal_set_message(t('The First Data web service requires curl. Please talk to your system administrator to get this configured.'));
+    return array('success' => FALSE);
+  }
+
+  // This handles the case where a user cancels their order on the checkout screen
+  if ($_SESSION['uc_firstdata_order'] != $order_id) {
+    $_SESSION['uc_firstdata_order'] = $order_id;
+    unset($_SESSION['uc_firstdata_attempt']);
+  }
+  // If users attempts to submit order more than once then modify Order ID so
+  // as to avoid a duplicate transaction error.
+  $_SESSION['uc_firstdata_attempt'] = empty($_SESSION['uc_firstdata_attempt']) ? 1 : ($_SESSION['uc_firstdata_attempt'] + 1);
+  $oid = $_SESSION['uc_firstdata_attempt'] > 1 ? ($order_id . '-' . $_SESSION['uc_firstdata_attempt']) : $order_id;
+  $order = uc_order_load($order_id);
+  $shipping = $tax = $subtotal = 0;
+  $description = '';
+  if (is_array($order->products)) {
+    foreach ($order->products as $product) {
+      if (!empty($description)) {
+        $description .= ' // ';
+      }
+      $description .= $product->title . ' x' . $product->qty;
+      if ($product->data['attributes']) {
+        foreach ($product->data['attributes'] as $key => $value) {
+          $description .= ', ' . $key . ': ' . $value;
+        }
+      }
+    }
+  }
+  $description = drupal_substr($description, 0, 255);
+
+  // convert some data before sending it to First Data
+  $cardexpyr = drupal_substr($order->payment_details['cc_exp_year'], 2, 2);
+  $cardexpmo = sprintf("%02d", $order->payment_details['cc_exp_month']);
+  $shipping = 0;
+  foreach ($order->line_items as $item) {
+    if ($item['type'] == 'shipping') {
+      $shipping += $item['amount'];
+    }
+  }
+
+  $tax = 0;
+  if (module_exists('uc_taxes')) {
+    foreach (uc_taxes_calculate($order) as $tax_item) {
+      $tax += $tax_item->amount;
+    }
+  }
+
+  $submit_data = array(
+    'x_country' => uc_get_country_data(array('country_id' => $order->billing_country)),
+    'x_ship_to_country' => uc_get_country_data(array('country_id' => $order->delivery_country)),
+  );
+
+  // build XML string
+  $cvmindicator = '';
+  $xml  = '<fdggwsapi:FDGGWSApiOrderRequest';
+  $xml .= ' xmlns:v1="http://secure.linkpt.net/fdggwsapi/schemas_us/v1"';
+  $xml .= ' xmlns:fdggwsapi="http://secure.linkpt.net/fdggwsapi/schemas_us/fdggwsapi" >';
+
+  $xml .= '<v1:Transaction>';
+
+  $xml .= '<v1:CreditCardTxType>';
+  $xml .= '  <v1:Type>sale</v1:Type>';
+  $xml .= '</v1:CreditCardTxType>';
+
+  $xml .= '<v1:CreditCardData>';
+  $xml .= "  <v1:CardNumber>" . $order->payment_details['cc_number'] . "</v1:CardNumber>";
+  $xml .= "  <v1:ExpMonth>" . $cardexpmo . "</v1:ExpMonth>";
+  $xml .= "  <v1:ExpYear>" . $cardexpyr . "</v1:ExpYear> ";
+  $xml .= "  <v1:CardCodeValue>" . $order->payment_details['cc_cvv'] . "</v1:CardCodeValue>";
+  $xml .= "  <v1:CardCodeIndicator>" . $cvmindicator . "</v1:CardCodeIndicator>";
+  $xml .= "</v1:CreditCardData>";
+
+  $xml .= "<v1:Payment>";
+  $xml .= "<v1:ChargeTotal>" . $amount . "</v1:ChargeTotal>";
+  if (!empty($subtotal)) {
+    $xml .= "<v1:SubTotal>" . $subtotal . "</v1:SubTotal>";
+  }
+  if (!empty($tax)) {
+    $xml .= "<v1:Tax>" . $tax . "</v1:Tax>";
+  }
+  if (!empty($shipping)) {
+    $xml .= "<v1:Shipping>" . $shipping . "</v1:Shipping>";
+  }
+  $xml .= "</v1:Payment>";
+
+  $xml .= "<v1:Billing>";
+  if (!empty($user->uid)) {
+    $xml .= "<v1:CustomerID>" . $user->uid . "</v1:CustomerID>";
+  }
+  $xml .= "  <v1:Name>" . $order->billing_first_name. " " . $order->billing_last_name . "</v1:Name>";
+  $xml .= "  <v1:Company>" . $order->billing_company . "</v1:Company>";
+  $xml .= "  <v1:Address1>" . $order->billing_street1 . "</v1:Address1>";
+  $xml .= "  <v1:Address2>" . $order->billing_street2 . "</v1:Address2>";
+  $xml .= "  <v1:City>" . $order->billing_city . "</v1:City>";
+  $xml .= "  <v1:State>" . uc_get_zone_code($order->billing_zone) . "</v1:State>";
+  $xml .= "  <v1:Zip>" . $order->billing_postal_code . "</v1:Zip>";
+  $xml .= "  <v1:Country>" . $submit_data['x_country'][0]['country_iso_code_2'] . "</v1:Country>";
+  $xml .= "  <v1:Phone>" . $order->billing_phone . "</v1:Phone>";
+  $xml .= "</v1:Billing>";
+
+  $xml .= "<v1:Shipping>";
+  $xml .= "  <v1:Name>" . $order->delivery_first_name . " " . $order->delivery_last_name . "</v1:Name>";
+  $xml .= "  <v1:Address1>" . $order->delivery_street1 . "</v1:Address1>";
+  $xml .= "  <v1:Address2>" . $order->delivery_street2 . "</v1:Address2>";
+  $xml .= "  <v1:City>" . $order->delivery_city . "</v1:City>";
+  $xml .= "  <v1:State>" . uc_get_zone_code($order->delivery_zone) . "</v1:State>";
+  $xml .= "  <v1:Zip>" . $order->delivery_postal_code . "</v1:Zip>";
+  $xml .= "  <v1:Country>" . $submit_data['x_ship_to_country'][0]['country_iso_code_2'] . "</v1:Country>";
+  $xml .= "</v1:Shipping>";
+
+ /* $xml .= '<v1:TransactionDetails>';
+  if (!empty($user->uid)) {
+    $xml .= "<v1:UserID>" . $user->uid . "</v1:UserID>";
+  }
+  $xml .= "  <v1:OrderID>" . $order_id . "</v1:OrderID>";
+  $xml .= "</v1:TransactionDetails>";*/
+
+  $xml .= "</v1:Transaction>";
+  $xml .= '</fdggwsapi:FDGGWSApiOrderRequest>';
+
+  $retarr = _uc_firstdata_gateway_execute_txn($xml);
+
+  if ($retarr['approved'] != 'APPROVED') {
+    $message = t('Credit card declined for !amount with error: !error',
+      array('!amount' => uc_currency_format($amount), '!error' => $retarr['error']));
+    $result = array(
+      'success' => FALSE,
+      'comment' => $message,
+      'message' => $message,
+      'uid' => $user->uid,
+    );
+  }
+  else {
+    $message = t('Credit card processed successfully for !amount.',
+      array('!amount' => uc_currency_format($amount)));
+    $result = array(
+      'success' => TRUE,
+      'comment' => $message,
+      'message' => $message,
+      'uid' => $user->uid,
+    );
+    unset($_SESSION['uc_firstdata_attempt']);
+  }
+  uc_order_comment_save($order_id, $user->uid, $message, 'admin');
+  return $result;
+}
+
+/**
+ * Executes the transaction against the Linkpoint server
+ * @return array An array based on the XML that linkpoint returns
+ */
+function _uc_firstdata_gateway_execute_txn($xml) {
+  if (variable_get('uc_firstdata_gateway_mode', 'test') == 'test') {
+    $ch = curl_init(UC_FIRSTDATA_GATEWAY_TEST_URL);
+  } else {
+    $ch = curl_init(UC_FIRSTDATA_GATEWAY_PRODUCTION_URL);
+  }
+  $root_path = str_replace("\\", "/", DRUPAL_ROOT);
+  $private_key_file_path = $root_path .'/firstdataprivatekey/'.variable_get('uc_firstdata_gateway_transaction_key', '');
+  $pem_file_path = $root_path .'/firstdataprivatekey/'.variable_get('uc_firstdata_gateway_transaction_cert', '');
+
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+  curl_setopt($ch, CURLOPT_VERBOSE, 1);
+  curl_setopt($ch, CURLOPT_POST, 1);
+  curl_setopt($ch, CURLOPT_HTTPHEADER, array("Content-Type: text/xml"));
+  curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+  $username = "WS" . variable_get('uc_firstdata_gateway_login_id', '') . "._.1";
+  $password = variable_get('uc_firstdata_gateway_login_pw', '');
+  curl_setopt($ch, CURLOPT_USERPWD, $username . ':' . $password);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, _uc_firstdata_gateway_soap_xml($xml));
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($ch, CURLOPT_SSLKEY, $private_key_file_path);
+  curl_setopt($ch, CURLOPT_SSLCERT, $pem_file_path);
+  curl_setopt($ch, CURLOPT_SSLKEYPASSWD, variable_get('uc_firstdata_gateway_transaction_pw', ''));
+  $buffer = curl_exec($ch);
+
+  if ($error = curl_error($ch)) {
+    $error .= '<br />The file: %file ';
+    if (file_exists(variable_get('uc_firstdata_gateway_transaction_key', ''))) {
+      $error .= 'exists: check your pass phrase or verify that you have downloaded the right key file and certificate.';
+    }
+    else {
+      $error .= 'does not exist: check your path.';
+    }
+    watchdog('uc_firstdata_gateway', $error, array('%file' => variable_get('firstdata_gateway_transaction_key', '')), WATCHDOG_ERROR);
+  }
+  curl_close($ch);
+
+  $retarr = array();
+  $retarr['approved'] = 'DECLINED';
+  $retarr['error'] = '';
+  
+  if (drupal_strlen($buffer) < 2) {
+    $retarr['error'] = 'Sorry - Could not connect to payment gateway.';
+  } else {
+    $dom = new DOMDocument();
+    $dom->loadXML($buffer);
+    foreach ($dom->getElementsByTagName("TransactionResult") as $nn) {
+      $retarr['approved'] = $nn->firstChild->nodeValue;
+    }
+    foreach ($dom->getElementsByTagName("ErrorMessage") as $nn) {
+      $retarr['error'] = $nn->firstChild->nodeValue;
+    }
+  }
+
+  return $retarr;
+}
+
+function _uc_firstdata_gateway_soap_xml($xml) {
+  $xml  = str_replace("&", "and", $xml);
+  $xml  = str_replace("'", " ", $xml);
+  $pre  = '<' . '?' . 'xml version="1.0" encoding="UTF-8" ' . '?' . '>';
+  $pre .= '<SOAP-ENV:Envelope';
+  $pre .= '  xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">';
+  $pre .= '<SOAP-ENV:Header /><SOAP-ENV:Body>';
+  $post = '</SOAP-ENV:Body></SOAP-ENV:Envelope>';
+  return $pre . $xml . $post;
+}
+

@@ -1,0 +1,19 @@
+<?php
+// $Id: uc_linkpoint_api.install,v 1.2 2009/06/26 18:32:02 jrust Exp $
+/**
+ * @file
+ * Install, update and uninstall functions for the uc_firstdata_gateway module.
+ */
+
+/**
+ * Implements hook_uninstall().
+ */
+function uc_firstdata_gateway_uninstall() {
+  variable_del('uc_firstdata_gateway_login_id');
+  variable_del('uc_firstdata_gateway_login_pw');
+  variable_del('uc_firstdata_gateway_transaction_cert');
+  variable_del('uc_firstdata_gateway_transaction_key');
+  variable_del('uc_firstdata_gateway_transaction_pw');
+  variable_del('uc_firstdata_gateway_mode');
+}
+
