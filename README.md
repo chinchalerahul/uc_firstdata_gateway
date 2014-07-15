@@ -36,8 +36,4 @@ Reference
 =========
 http://www.firstdata.com/support/manuals_and_guides/global_gateway.htm
 
-Credits
-=======
-Developed by Christopher Schuster (http://livoris.de/ | cs@livoris.de).
-Based on [UC Linkpoint API](http://drupal.org/project/uc_linkpoint_api).
 
